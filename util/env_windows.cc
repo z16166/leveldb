@@ -384,10 +384,15 @@ class WindowsEnv : public Env {
  public:
   WindowsEnv();
   ~WindowsEnv() override {
-    static const char msg[] =
-        "WindowsEnv singleton destroyed. Unsupported behavior!\n";
-    std::fwrite(msg, 1, sizeof(msg), stderr);
-    std::abort();
+    if (background_thread_.joinable()) {
+      background_work_mutex_.Lock();
+
+      stop_background_thread_ = true;
+      background_work_cv_.Signal();
+
+      background_work_mutex_.Unlock();
+      background_thread_.join();
+    }
   }
 
   Status NewSequentialFile(const std::string& filename,
@@ -693,11 +698,13 @@ class WindowsEnv : public Env {
   port::Mutex background_work_mutex_;
   port::CondVar background_work_cv_ GUARDED_BY(background_work_mutex_);
   bool started_background_thread_ GUARDED_BY(background_work_mutex_);
+  bool stop_background_thread_ GUARDED_BY(background_work_mutex_);
 
   std::queue<BackgroundWorkItem> background_work_queue_
       GUARDED_BY(background_work_mutex_);
 
   Limiter mmap_limiter_;  // Thread-safe.
+  std::thread background_thread_;
 };
 
 // Return the maximum number of concurrent mmaps.
@@ -706,6 +713,7 @@ int MaxMmaps() { return g_mmap_limit; }
 WindowsEnv::WindowsEnv()
     : background_work_cv_(&background_work_mutex_),
       started_background_thread_(false),
+      stop_background_thread_(false),
       mmap_limiter_(MaxMmaps()) {}
 
 void WindowsEnv::Schedule(
@@ -716,8 +724,7 @@ void WindowsEnv::Schedule(
   // Start the background thread, if we haven't done so already.
   if (!started_background_thread_) {
     started_background_thread_ = true;
-    std::thread background_thread(WindowsEnv::BackgroundThreadEntryPoint, this);
-    background_thread.detach();
+    background_thread_ = std::thread(WindowsEnv::BackgroundThreadEntryPoint, this);
   }
 
   // If the queue is empty, the background thread may be waiting for work.
@@ -736,6 +743,11 @@ void WindowsEnv::BackgroundThreadMain() {
     // Wait until there is work to be done.
     while (background_work_queue_.empty()) {
       background_work_cv_.Wait();
+
+      if (stop_background_thread_) {
+        background_work_mutex_.Unlock();
+        return;
+      }
     }
 
     assert(!background_work_queue_.empty());
@@ -765,20 +777,27 @@ class SingletonEnv {
  public:
   SingletonEnv() {
 #if !defined(NDEBUG)
-    env_initialized_.store(true, std::memory_order_relaxed);
+    env_initialized_.store(false, std::memory_order_relaxed);
 #endif  // !defined(NDEBUG)
-    static_assert(sizeof(env_storage_) >= sizeof(EnvType),
-                  "env_storage_ will not fit the Env");
-    static_assert(alignof(decltype(env_storage_)) >= alignof(EnvType),
-                  "env_storage_ does not meet the Env's alignment needs");
-    new (&env_storage_) EnvType();
   }
   ~SingletonEnv() = default;
 
   SingletonEnv(const SingletonEnv&) = delete;
   SingletonEnv& operator=(const SingletonEnv&) = delete;
 
-  Env* env() { return reinterpret_cast<Env*>(&env_storage_); }
+  Env* env() {
+    static typename EnvType env_storage_;
+
+#if !defined(NDEBUG)
+    env_initialized_.store(true, std::memory_order_relaxed);
+#endif  // !defined(NDEBUG)
+    static_assert(sizeof(env_storage_) >= sizeof(EnvType),
+                  "env_storage_ will not fit the Env");
+    static_assert(alignof(decltype(env_storage_)) >= alignof(EnvType),
+                  "env_storage_ does not meet the Env's alignment needs");
+
+    return reinterpret_cast<Env*>(&env_storage_);
+  }
 
   static void AssertEnvNotInitialized() {
 #if !defined(NDEBUG)
@@ -787,8 +806,7 @@ class SingletonEnv {
   }
 
  private:
-  typename std::aligned_storage<sizeof(EnvType), alignof(EnvType)>::type
-      env_storage_;
+  
 #if !defined(NDEBUG)
   static std::atomic<bool> env_initialized_;
 #endif  // !defined(NDEBUG)
