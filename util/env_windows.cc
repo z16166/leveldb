@@ -786,7 +786,7 @@ class SingletonEnv {
   SingletonEnv& operator=(const SingletonEnv&) = delete;
 
   Env* env() {
-    static typename EnvType env_storage_;
+    static EnvType env_storage_;
 
 #if !defined(NDEBUG)
     env_initialized_.store(true, std::memory_order_relaxed);
